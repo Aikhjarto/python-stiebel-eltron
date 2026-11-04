@@ -168,11 +168,6 @@ LWZ = Controller(
     compressor_starts=True,
 )
 
-# The two shared components from pystiebeleltron/__init__.py, as (low, high) wire
-# address ranges, so they join their space's device-wide ranges.
-SHARED_INPUT_RANGE = (5000, 5230)  # EnergySystemInformation
-SHARED_HOLDING_RANGE = (4000, 4277)  # EnergyManagementSettings
-
 
 def python_name(name: str, suffix: str = "") -> str:
     """A register's enum/attribute stem, suffix-disambiguated (pre-lowercasing)."""
@@ -224,8 +219,10 @@ def _field_factory(row: list[str], cols: Columns, *, writable: bool, nan: str = 
         # A documented 0..1 range is a flag, not a number worth comparing, and
         # boolean() also turns an out-of-spec code into None rather than a
         # value that reads as on. It takes no unit, and none of these carry one.
+        # The range still guards writes: boolean() encodes whatever int() makes
+        # of the value, so without the validator a 2 would reach the register.
         if (low, high) == (0, 1):
-            return f"boolean({wire}, nan={nan}{', writable=True' if writable else ''})"
+            return f"boolean({wire}, nan={nan}{writable_arg})"
         return f"integer({wire}, signed=False, nan={nan}{unit_arg}{writable_arg})"
     raise ValueError(f"unhandled data type {data_type!r} for {name!r}")
 
@@ -247,8 +244,6 @@ class Component:
     member: str  # the API attribute holding this component
     register_space: str
     ranges_const: str = ""
-    low: int = 0  # first wire address the block covers
-    high: int = 0  # last wire address the block covers
     addresses: set[int] = field(default_factory=set)  # wire addresses defined by the CSV rows
     fields: list[str] = field(default_factory=list)  # "attr = factory(...)"
     repeats: list[str] = field(default_factory=list)  # "attr = repeating_group(...)"
@@ -260,12 +255,6 @@ class Component:
 def _read_rows(api_path: Path, block: Block) -> list[list[str]]:
     with (api_path / block.path).open() as handle:
         return list(csv.reader(handle))[1:]
-
-
-def _span(rows: list[list[str]]) -> tuple[int, int]:
-    """The block's (low, high) wire address range, covering every row read."""
-    addresses = [int(row[0]) - 1 for row in rows]
-    return min(addresses), max(addresses)
 
 
 def _addresses(rows: list[list[str]]) -> set[int]:
@@ -311,13 +300,10 @@ def _repeating_sub_component(repeat: Repeat, by_index: dict[int, list[list[str]]
 
 def _plain_component(block: Block, rows: list[list[str]], controller: Controller) -> tuple[Component, list[SubComponent]]:
     cols = controller.columns
-    low, high = _span(rows)
     component = Component(
         f"{controller.type}{class_name(block.name)}",
         field_attr(block.name),
         block.space,
-        low=low,
-        high=high,
         addresses=_addresses(rows),
     )
     groups: dict[str, dict[int, list[list[str]]]] = {repeat.attr: {} for repeat in block.repeats}
@@ -371,16 +357,29 @@ def _plain_component(block: Block, rows: list[list[str]], controller: Controller
     return component, sub_components
 
 
+def _following_word(rows: list[list[str]], index: int, block: Block, cols: Columns, prefix: str) -> list[str]:
+    """The row after ``index``, which must carry the ``prefix`` word of the same counter.
+
+    The energy CSVs spell a counter as adjacent rows: a DAY row is followed by
+    its total's LOW word, and a LOW word by its HI word, each one address up.
+    The generator pairs them by position, so a CSV that breaks the order fails
+    here instead of silently pairing the wrong registers.
+    """
+    row = rows[index]
+    expected = int(row[0]) + 1
+    following = rows[index + 1] if index + 1 < len(rows) else None
+    if following is None or not following[cols.suffix_col].startswith(prefix) or int(following[0]) != expected:
+        raise ValueError(f"{block.name}: row {row[0]} {row[cols.name_col]!r} must be followed by its {prefix} word at {expected}")
+    return following
+
+
 def _energy_component(block: Block, rows: list[list[str]], controller: Controller) -> Component:
     """Energy block: LOW/HI pairs combine in a scaled_sum; DAY rows gain a running total."""
     cols = controller.columns
-    low, high = _span(rows)
     component = Component(
         f"{controller.type}{class_name(block.name)}",
         field_attr(block.name),
         block.space,
-        low=low,
-        high=high,
         addresses=_addresses(rows),
     )
     seen: set[str] = set()
@@ -398,11 +397,12 @@ def _energy_component(block: Block, rows: list[list[str]], controller: Controlle
             continue  # consumed by the preceding LOW row's scaled_sum
         if suffix[:3] == "LOW":
             # kWh (LOW) + MWh (HI) summed into a single counter, in kWh.
+            _following_word(rows, index, block, cols, "HI")
             add(attr(name, suffix[3:].strip()), f'scaled_sum({wire}, (1, 1000), unit="{unit}")')
             continue
         add(attr(name, suffix), _field_factory(row, cols, writable=False))
         if name[-3:] == "DAY":
-            following = rows[index + 1]
+            following = _following_word(rows, index, block, cols, "LOW")
             total = attr(following[cols.name_col], following[cols.suffix_col][3:].strip())
             running = attr(name + "_AND_TOTAL", suffix)
             component.day_and_total.append((attr(name, suffix), total, running))
@@ -461,6 +461,8 @@ def _imports(controller: Controller, components: list[Component]) -> list[str]:
     lines.append("")
     lines.append(f"from . import {', '.join(sorted(local))}")
     lines.append("from ._components import ControllerComponents")
+    if any(component.day_and_total for component in components):
+        lines.append("from ._day_and_total import DayAndTotalCounter")
     return lines
 
 
